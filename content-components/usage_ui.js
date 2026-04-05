@@ -267,18 +267,21 @@ class UsageUI {
 
 		// Add footers
 		const isElectron = await sendBackgroundMessage({ type: 'isElectron' });
-		if (!isElectron) {
-			const desktopFooter = this.createDesktopFooter();
-			content.appendChild(desktopFooter);
+		const hideFooter = await sendBackgroundMessage({ type: 'getHidePromotionalFooter' });
+		if (!hideFooter) {
+			if (!isElectron) {
+				const desktopFooter = this.createDesktopFooter();
+				content.appendChild(desktopFooter);
 
-			const qolFooter = this.createQoLFooter();
-			if (qolFooter) {
-				content.appendChild(qolFooter);
+				const qolFooter = this.createQoLFooter();
+				if (qolFooter) {
+					content.appendChild(qolFooter);
+				}
 			}
-		}
 
-		const donateFooter = this.createDonateFooter();
-		content.appendChild(donateFooter);
+			const donateFooter = this.createDonateFooter();
+			content.appendChild(donateFooter);
+		}
 
 		container.appendChild(header);
 		container.appendChild(content);

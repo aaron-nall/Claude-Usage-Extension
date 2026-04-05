@@ -374,6 +374,7 @@ class SettingsCard extends FloatingCard {
 				setTimeout(() => errorMsg.remove(), 3000);
 				return;
 			}
+			await sendBackgroundMessage({ type: 'setHidePromotionalFooter', value: hideFooterCheckbox.checked });
 			location.reload();
 		});
 
@@ -400,12 +401,33 @@ class SettingsCard extends FloatingCard {
 		toggleContainer.appendChild(checkbox);
 		toggleContainer.appendChild(toggleLabel);
 
+		// Hide promotional footer toggle
+		const hideFooterContainer = document.createElement('div');
+		hideFooterContainer.className = 'ut-row';
+		hideFooterContainer.style.alignItems = 'start';
+		hideFooterContainer.style.gap = '6px';
+		hideFooterContainer.style.marginBottom = '8px';
+
+		const hideFooterCheckbox = document.createElement('input');
+		hideFooterCheckbox.type = 'checkbox';
+		hideFooterCheckbox.id = 'ut-hide-footer-toggle';
+		hideFooterCheckbox.checked = await sendBackgroundMessage({ type: 'getHidePromotionalFooter' }) || false;
+
+		const hideFooterLabel = document.createElement('label');
+		hideFooterLabel.htmlFor = 'ut-hide-footer-toggle';
+		hideFooterLabel.className = 'text-sm';
+		hideFooterLabel.textContent = 'Hide promotional links';
+
+		hideFooterContainer.appendChild(hideFooterCheckbox);
+		hideFooterContainer.appendChild(hideFooterLabel);
+
 		// Assemble
 		this.element.appendChild(label);
 		this.element.appendChild(input);
 		buttonContainer.appendChild(saveButton);
 		buttonContainer.appendChild(debugButton);
 		this.element.appendChild(toggleContainer);
+		this.element.appendChild(hideFooterContainer);
 		this.element.appendChild(buttonContainer);
 
 		this.addCloseButton();

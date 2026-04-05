@@ -327,6 +327,9 @@ messageRegistry.register('setAPIKey', async (message) => {
 messageRegistry.register('getResetNotifEnabled', () => getStorageValue('resetNotifEnabled', false));
 messageRegistry.register('setResetNotifEnabled', (message) => setStorageValue('resetNotifEnabled', message.value));
 
+messageRegistry.register('getHidePromotionalFooter', () => getStorageValue('hidePromotionalFooter', false));
+messageRegistry.register('setHidePromotionalFooter', (message) => setStorageValue('hidePromotionalFooter', message.value));
+
 messageRegistry.register('isElectron', () => isElectron);
 messageRegistry.register('getMonkeypatchPatterns', () => isElectron ? INTERCEPT_PATTERNS : false);
 
