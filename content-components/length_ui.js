@@ -1,6 +1,7 @@
-/* global CONFIG, Log, setupTooltip, getResetTimeHTML, sleep, sendBackgroundMessage,
+/* global CONFIG, Log, setupTooltip, getResetTimeHTML, sleep, sendBackgroundMessage, getActiveOrgId,
    isMobileView, isCodePage, UsageData, ConversationData, getConversationId, getCurrentModel,
-   RED_WARNING, BLUE_HIGHLIGHT, SUCCESS_GREEN, SELECTORS */
+   getCurrentModelVersion, RED_WARNING, BLUE_HIGHLIGHT, SUCCESS_GREEN, SELECTORS,
+   LayoutManager, mountToAnchor */
 'use strict';
 
 // Length UI actor - handles all conversation-related displays
@@ -11,6 +12,7 @@ class LengthUI {
 			usageData: null,
 			conversationData: null,
 			currentModel: null,
+			currentModelVersion: null,
 			nextMessageCost: null,
 			cachedUntilTimestamp: null,
 		};
@@ -37,10 +39,15 @@ class LengthUI {
 
 	setupMessageListeners() {
 		browser.runtime.onMessage.addListener((message) => {
+			const myOrgId = getActiveOrgId();
 			if (message.type === 'updateUsage') {
+				const msgOrgId = message.data.usageData?.orgId;
+				if (msgOrgId && myOrgId && msgOrgId !== myOrgId) return;
 				this.handleUsageUpdate(message.data.usageData);
 			}
 			if (message.type === 'updateConversationData') {
+				const msgOrgId = message.data.conversationData?.orgId;
+				if (msgOrgId && myOrgId && msgOrgId !== myOrgId) return;
 				this.handleConversationUpdate(message.data.conversationData);
 			}
 		});
@@ -133,76 +140,9 @@ class LengthUI {
 	// ========== MOUNT (attach to page) ==========
 
 	mountTitleArea() {
-		const chatMenu = document.querySelector(SELECTORS.CHAT_MENU);
-		if (!chatMenu) return false;
-
-		const titleLine = chatMenu.closest('.flex.min-w-0.flex-1');
-		if (!titleLine) return false;
-
-		const container = this.elements.titleArea.container;
-		const mobile = isMobileView();
-		const headerRow = titleLine.parentElement;
-
-		if (mobile) {
-			// On mobile, mount as sibling to titleLine to avoid layout issues
-			if (!headerRow) return false;
-
-			// Remove from titleLine if it was there (e.g., window resized)
-			if (titleLine.contains(container)) {
-				container.remove();
-			}
-
-			// Enable flex-wrap on parent so stats go to new line
-			headerRow.classList.add('flex-wrap');
-
-			if (!headerRow.contains(container)) {
-				headerRow.appendChild(container);
-			}
-
-			// Full width on mobile, reduce vertical gap
-			container.style.flexBasis = '100%';
-			container.style.marginTop = '-36px'; // Counteract the parent's gap
-			// Extend background to left edge by pulling out of parent padding
-			const headerPadding = parseFloat(getComputedStyle(headerRow).paddingLeft) || 0;
-			container.style.marginLeft = `-${headerPadding}px`;
-			container.style.paddingLeft = `${headerPadding + 8}px`; // Keep text aligned with title
-			container.classList.remove('!px-2');
-			container.classList.add('bg-bg-100'); // Match header background
-		} else {
-			// On desktop, mount inside titleLine as before
-			// Remove from headerRow if it was there (e.g., window resized)
-			if (headerRow && headerRow.contains(container) && !titleLine.contains(container)) {
-				container.remove();
-			}
-
-			this.prepareLayoutForTitleArea(titleLine, chatMenu);
-
-			if (!titleLine.contains(container)) {
-				titleLine.appendChild(container);
-			}
-
-			container.style.flexBasis = '100%';
-
-			// Adjust padding based on whether there's a project
-			const hasProject = !!titleLine.querySelector('a[href^="/project/"]');
-			container.classList.toggle('!px-2', !hasProject);
-		}
-
-		return true;
-	}
-
-	prepareLayoutForTitleArea(titleLine, chatMenu) {
-		// Adjust header height on mobile
-		let header = titleLine;
-		while (header && !header.tagName.toLowerCase().includes('header')) {
-			header = header.parentElement;
-		}
-		if (header && header.classList.contains('h-12') && isMobileView()) {
-			header.classList.remove('h-12');
-		}
-
-		// Enable flex wrap so our element can go to a new line
-		titleLine.classList.add('flex-wrap');
+		const anchor = LayoutManager.getAnchor('titleArea');
+		if (!anchor) return false;
+		return mountToAnchor(this.elements.titleArea.container, anchor);
 	}
 
 	mountStatLine() {
@@ -227,12 +167,16 @@ class LengthUI {
 
 	async renderAll() {
 		this.state.currentModel = await getCurrentModel(200);
+		this.state.currentModelVersion = await getCurrentModelVersion(200);
+		await Log('LengthUI: renderAll - detected:', this.state.currentModelVersion,
+			'| stored on conversation:', this.state.conversationData?.modelVersion,
+			'| isCurrentlyCached:', this.state.conversationData?.isCurrentlyCached(this.state.currentModelVersion));
 		this.renderCostAndLength();
 		this.renderEstimate();
 	}
 
 	renderCostAndLength() {
-		const { conversationData, currentModel } = this.state;
+		const { conversationData, currentModel, currentModelVersion } = this.state;
 		const { length, cost, cached, container } = this.elements.titleArea;
 
 		if (!conversationData) {
@@ -255,11 +199,11 @@ class LengthUI {
 			: baseTooltip;
 
 		// Cost
-		const weightedCost = conversationData.getWeightedFutureCost(currentModel);
+		const weightedCost = conversationData.getWeightedFutureCost(currentModel, currentModelVersion);
 		this.state.nextMessageCost = weightedCost;
 
 		let costColor;
-		if (conversationData.isCurrentlyCached()) {
+		if (conversationData.isCurrentlyCached(currentModelVersion)) {
 			costColor = SUCCESS_GREEN;
 		} else {
 			costColor = conversationData.isExpensive() ? RED_WARNING : BLUE_HIGHLIGHT;
@@ -275,9 +219,10 @@ class LengthUI {
 			// During extra usage, cache reads cost 10% of input (not free)
 			// Interpolate between cached (free) and uncached (full price) costs
 			// This is technically not entirely accurate, but it's accurate enough and doesn't require reworking half the codebase
-			const weight = CONFIG.MODEL_WEIGHTS[currentModel] || CONFIG.MODEL_WEIGHTS["Sonnet"];
-			const interpolatedFutureCost = conversationData.futureCost +
-				CONFIG.EXTRA_USAGE_CACHING_MULTIPLIER * (conversationData.uncachedFutureCost - conversationData.futureCost);
+			const weight = CONFIG.MODEL_WEIGHTS[currentModel] || CONFIG.MODEL_WEIGHTS[CONFIG.DEFAULT_MODEL];
+			const baseFutureCost = conversationData.isCurrentlyCached(currentModelVersion) ? conversationData.futureCost : conversationData.uncachedFutureCost;
+			const interpolatedFutureCost = baseFutureCost +
+				CONFIG.EXTRA_USAGE_CACHING_MULTIPLIER * (conversationData.uncachedFutureCost - baseFutureCost);
 			const dollars = Math.round(interpolatedFutureCost * weight) / 1_000_000;
 			cost.innerHTML = `Cost: <span style="color: ${costColor}">$${dollars.toFixed(2)}</span>`;
 		} else {
@@ -285,7 +230,7 @@ class LengthUI {
 		}
 
 		// Cached
-		if (conversationData.isCurrentlyCached()) {
+		if (conversationData.isCurrentlyCached(currentModelVersion)) {
 			this.state.cachedUntilTimestamp = conversationData.conversationIsCachedUntil;
 			const timeInfo = conversationData.getTimeUntilCacheExpires();
 			cached.innerHTML = `Cached for: <span class="ut-cached-time" style="color: ${SUCCESS_GREEN}">${timeInfo.minutes}m</span>`;
@@ -351,7 +296,7 @@ class LengthUI {
 			return;
 		}
 
-		const { usageData, conversationData, currentModel } = this.state;
+		const { usageData, conversationData, currentModel, currentModelVersion } = this.state;
 
 		const msgPrefix = isMobileView() ? 'Msgs Left: ' : 'Messages left: ';
 
@@ -360,14 +305,15 @@ class LengthUI {
 			return;
 		}
 
-		const messageCost = conversationData.getWeightedFutureCost(currentModel);
+		const messageCost = conversationData.getWeightedFutureCost(currentModel, currentModelVersion);
 		const limiting = usageData.getLimitingFactor(messageCost);
 
 		// If regular limits are maxed but extra usage is available, estimate from dollars
 		if ((!limiting || limiting.messagesLeft <= 0) && usageData.hasExtraUsage()) {
-			const weight = CONFIG.MODEL_WEIGHTS[currentModel] || CONFIG.MODEL_WEIGHTS["Sonnet"];
-			const interpolatedFutureCost = conversationData.futureCost +
-				CONFIG.EXTRA_USAGE_CACHING_MULTIPLIER * (conversationData.uncachedFutureCost - conversationData.futureCost);
+			const weight = CONFIG.MODEL_WEIGHTS[currentModel] || CONFIG.MODEL_WEIGHTS[CONFIG.DEFAULT_MODEL];
+			const baseFutureCost = conversationData.isCurrentlyCached(currentModelVersion) ? conversationData.futureCost : conversationData.uncachedFutureCost;
+			const interpolatedFutureCost = baseFutureCost +
+				CONFIG.EXTRA_USAGE_CACHING_MULTIPLIER * (conversationData.uncachedFutureCost - baseFutureCost);
 			const costPerMessageDollars = Math.round(interpolatedFutureCost * weight) / 1_000_000;
 
 			if (costPerMessageDollars > 0) {
@@ -457,7 +403,7 @@ class LengthUI {
 		const newConversation = getConversationId();
 		const isHomePage = newConversation === null;
 
-		if (this.state.conversationData?.conversationId !== newConversation && !isHomePage) {
+		if (this.state.conversationData?.conversationId != newConversation && !isHomePage) {
 			await Log('LengthUI: Conversation changed, requesting data');
 			sendBackgroundMessage({
 				type: 'requestData',
@@ -478,9 +424,12 @@ class LengthUI {
 
 	async checkModelChange() {
 		const newModel = await getCurrentModel(200);
-		if (newModel && newModel !== this.state.currentModel) {
+		const newModelVersion = await getCurrentModelVersion(200);
+		if ((newModel && newModel !== this.state.currentModel) ||
+			(newModelVersion && newModelVersion !== this.state.currentModelVersion)) {
 			await Log('LengthUI: Model changed, recalculating displays');
 			this.state.currentModel = newModel;
+			this.state.currentModelVersion = newModelVersion;
 			if (this.state.conversationData) {
 				this.renderCostAndLength();
 				this.renderEstimate();

@@ -58,14 +58,7 @@ browser.runtime.onMessage.addListener(async (message, sender) => {
 	return runOnceInitialized(handleMessageFromContent, [message, sender]);
 });
 
-if (!isElectron) {
-	browser.action.onClicked.addListener(() => {
-		// Always open debug page when clicking the extension icon
-		browser.tabs.create({
-			url: browser.runtime.getURL('debug.html')
-		});
-	});
-}
+
 
 
 if (browser.contextMenus) {
@@ -334,10 +327,8 @@ messageRegistry.register('isElectron', () => isElectron);
 messageRegistry.register('getMonkeypatchPatterns', () => isElectron ? INTERCEPT_PATTERNS : false);
 
 async function openDebugPage() {
-	if (browser.tabs?.create) {
-		browser.tabs.create({
-			url: browser.runtime.getURL('debug.html')
-		});
+	if (!isElectron) {
+		browser.tabs.create({ url: browser.runtime.getURL('debug.html') });
 		return true;
 	}
 	return 'fallback';
@@ -353,10 +344,7 @@ async function requestData(message, sender, orgId) {
 	// Always fetch and send fresh usage data
 	const usageData = await api.getUsageData();
 	await scheduleResetNotifications(orgId, usageData);
-	await sendTabMessage(sender.tab.id, {
-		type: 'updateUsage',
-		data: { usageData: usageData.toJSON() }
-	});
+	await updateAllTabsWithUsage(usageData);
 
 	if (conversationId) {
 		// Check conversation cache
@@ -396,6 +384,70 @@ async function requestData(message, sender, orgId) {
 	return true;
 }
 messageRegistry.register(requestData);
+
+async function getPopupUsageData() {
+	const orgMap = new Map(); // orgId -> cookieStoreId
+
+	const storeIds = new Set();
+	try {
+		if (browser.contextualIdentities) {
+			storeIds.add('firefox-default');
+			const containers = await browser.contextualIdentities.query({});
+			for (const c of containers) storeIds.add(c.cookieStoreId);
+		} else {
+			const stores = await browser.cookies.getAllCookieStores();
+			for (const s of stores) storeIds.add(s.id);
+		}
+	} catch (e) {
+		await Log("warn", "Cookie store enumeration failed, falling back to getAllCookieStores:", e);
+		try {
+			const stores = await browser.cookies.getAllCookieStores();
+			for (const s of stores) storeIds.add(s.id);
+		} catch (e2) {
+			await Log("warn", "getAllCookieStores also failed:", e2);
+		}
+	}
+
+	await Log("Checking cookie stores for org IDs:", [...storeIds]);
+	for (const storeId of storeIds) {
+		try {
+			const cookie = await browser.cookies.get({
+				name: 'lastActiveOrg',
+				url: 'https://claude.ai',
+				storeId
+			});
+			if (cookie?.value && !orgMap.has(cookie.value)) {
+				orgMap.set(cookie.value, storeId);
+			}
+		} catch (e) {
+			await Log("warn", `Failed to check cookies for store ${storeId}:`, e);
+		}
+	}
+
+	// Fallback: check stored orgIds if no cookies found
+	if (orgMap.size === 0) {
+		await tokenStorageManager.ensureOrgIds();
+		for (const orgId of tokenStorageManager.orgIds) {
+			orgMap.set(orgId, null);
+		}
+	}
+
+	if (orgMap.size === 0) return [];
+
+	const results = await Promise.allSettled(
+		Array.from(orgMap.entries()).map(async ([orgId, cookieStoreId]) => {
+			const api = new ClaudeAPI(cookieStoreId, orgId);
+			const usageData = await api.getUsageData();
+			const org = await api.getOrgInfo(); // cache hit — getUsageData already fetched it
+			return { orgId, orgName: org?.name || null, cookieStoreId, usageData: usageData.toJSON() };
+		})
+	);
+
+	return results.map(r =>
+		r.status === 'fulfilled' ? r.value : { orgId: r.reason?.orgId, error: String(r.reason) }
+	);
+}
+messageRegistry.register(getPopupUsageData);
 
 async function interceptedRequest(message, sender) {
 	await Log("Got intercepted request, are we in electron?", isElectron);
@@ -469,7 +521,7 @@ async function processResponse(orgId, conversationId, responseKey, details) {
 
 	const pendingRequest = await pendingRequests.get(responseKey);
 	const isNewMessage = pendingRequest !== undefined;
-	const model = pendingRequest?.model || "Sonnet";
+	const model = pendingRequest?.model || CONFIG.DEFAULT_MODEL;
 
 	// Fetch current usage limits from endpoint
 	const usageData = await api.getUsageData();
@@ -508,6 +560,13 @@ async function processResponse(orgId, conversationId, responseKey, details) {
 
 	conversationData.length += profileTokens;
 	conversationData.model = model;
+	await Log('processResponse: modelVersion -',
+		'from API:', conversationData.modelVersion,
+		'| from pendingRequest:', pendingRequest?.modelVersion);
+	if (pendingRequest?.modelVersion) {
+		conversationData.modelVersion = pendingRequest.modelVersion;
+	}
+	await Log('processResponse: modelVersion final:', conversationData.modelVersion);
 
 	// If new message: log delta and update total tokens
 	if (isNewMessage && pendingRequest.previousUsage) {
@@ -648,7 +707,7 @@ async function onBeforeRequestHandler(details) {
 		await tokenStorageManager.addOrgId(orgId);
 		const conversationId = urlParts[urlParts.indexOf('chat_conversations') + 1];
 
-		let model = "Sonnet"; // Default model
+		let model = CONFIG.DEFAULT_MODEL;
 		if (requestBodyJSON?.model) {
 			const modelString = requestBodyJSON.model.toLowerCase();
 			for (const modelType of CONFIG.MODELS) {
@@ -686,12 +745,14 @@ async function onBeforeRequestHandler(details) {
 		}
 
 		// Store pending request with all data
+		await Log('onBeforeRequest: storing modelVersion:', requestBodyJSON?.model, '| class:', model);
 		await pendingRequests.set(key, {
 			orgId: orgId,
 			conversationId: conversationId,
 			tabId: details.tabId,
 			styleId: styleId,
 			model: model,
+			modelVersion: requestBodyJSON?.model || CONFIG.DEFAULT_MODEL_VERSION,
 			requestTimestamp: Date.now(),
 			toolDefinitions: toolDefs,
 			previousUsage: previousUsage
@@ -728,6 +789,41 @@ async function onCompletedHandler(details) {
 		});
 
 		processNextTask();
+	}
+
+	// Branch switch — debounce, then invalidate cache and fetch fresh data
+	if (details.url.includes("/current_leaf_message_uuid")) {
+		const urlParts = details.url.split('/');
+		const conversationId = urlParts[urlParts.indexOf('chat_conversations') + 1];
+
+		if (branchSwitchTimers.has(conversationId)) {
+			clearTimeout(branchSwitchTimers.get(conversationId));
+		}
+
+		branchSwitchTimers.set(conversationId, setTimeout(() => {
+			branchSwitchTimers.delete(conversationId);
+			pendingTasks.push(async () => {
+				const orgId = urlParts[urlParts.indexOf('organizations') + 1];
+
+				await conversationCache.delete(conversationId);
+				await Log("Branch switch detected — fetching fresh data for:", conversationId);
+
+				const api = new ClaudeAPI(details.cookieStoreId, orgId);
+				const conversation = await api.getConversation(conversationId);
+				const conversationData = await conversation.getInfo(false);
+				const profileTokens = await api.getProfileTokens();
+
+				if (conversationData) {
+					conversationData.length += profileTokens;
+					conversationData.cost += profileTokens * CONFIG.CACHING_MULTIPLIER;
+					conversationData.uncachedCost += profileTokens * CONFIG.CACHING_MULTIPLIER;
+
+					await conversationCache.set(conversationId, conversationData.toJSON(), CONVERSATION_CACHE_TTL);
+					await updateTabWithConversationData(details.tabId, conversationData);
+				}
+			});
+			processNextTask();
+		}, 5000));
 	}
 
 	// Claude Code session events — refresh usage
@@ -795,6 +891,7 @@ pendingRequests = new StoredMap("pendingRequests"); // conversationId -> {userId
 scheduledNotifications = new StoredMap('scheduledNotifications');
 const conversationCache = new StoredMap("conversationCache");	// This is for convo stats
 const CONVERSATION_CACHE_TTL = 60 * 60 * 1000; // 60 minutes
+const branchSwitchTimers = new Map(); // conversationId → timeoutId (debounce)
 
 // Set up repeating alarm for reset notification polling (every 3 minutes)
 getAlarm('checkResetNotifications').then(existing => {

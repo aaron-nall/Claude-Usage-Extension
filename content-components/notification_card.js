@@ -1,7 +1,32 @@
 /* global Log, RED_WARNING, BLUE_HIGHLIGHT, sendBackgroundMessage, SUCCESS_GREEN */
 'use strict';
 
-const DONATION_TOKEN_THRESHOLDS = [10000000, 50000000, 100000000, 300000000, 1000000000];
+const DONATION_1M = 1000000;
+const DONATION_10M = 10000000;
+
+function openDebugOverlay() {
+	// Remove existing overlay if present
+	const existing = document.getElementById('ut-debug-overlay');
+	if (existing) { existing.remove(); return; }
+
+	const overlay = document.createElement('div');
+	overlay.id = 'ut-debug-overlay';
+	overlay.style.cssText = 'position:;inset:0;z-index:99999;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;';
+
+	const closeBtn = document.createElement('button');
+	closeBtn.textContent = '\u00D7';
+	closeBtn.style.cssText = 'position:absolute;top:12px;right:16px;font-size:24px;background:none;border:none;color:#666;cursor:pointer;z-index:1;';
+	closeBtn.addEventListener('click', () => overlay.remove());
+
+	const iframe = document.createElement('iframe');
+	iframe.src = browser.runtime.getURL('debug.html');
+	iframe.style.cssText = 'width:90vw;height:90vh;border:none;border-radius:8px;';
+
+	overlay.appendChild(closeBtn);
+	overlay.appendChild(iframe);
+	overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+	document.body.appendChild(overlay);
+}
 
 // Draggable functionality for cards
 function makeDraggable(element, dragHandle = null) {
@@ -88,7 +113,9 @@ function makeDraggable(element, dragHandle = null) {
 // Base floating card class
 class FloatingCard {
 	constructor() {
-		this.defaultPosition = { top: '20px', right: '20px' }
+		// Electron needs extra top offset to clear the toolbar in the content pane
+		const isElectronClient = !!document.querySelector('.dframe-content-inner');
+		this.defaultPosition = { top: isElectronClient ? '40px' : '20px', right: '20px' };
 		this.element = document.createElement('div');
 		this.element.className = 'bg-bg-100 border border-border-400 text-text-000 ut-card';
 	}
@@ -120,7 +147,18 @@ class FloatingCard {
 				this.element.style[key] = value;
 			});
 		}
-		document.body.appendChild(this.element);
+		// On Electron, inject into content area so cards don't overlap window controls.
+		// Ensure the mount is a positioning context so `top`/`right` are relative to it.
+		const electronMount = document.querySelector('.dframe-content-inner');
+		if (electronMount) {
+			if (getComputedStyle(electronMount).position === 'static') {
+				electronMount.style.position = 'relative';
+			}
+			this.element.style.position = 'absolute';
+			electronMount.appendChild(this.element);
+		} else {
+			document.body.appendChild(this.element);
+		}
 	}
 
 	makeCardDraggable(dragHandle = null) {
@@ -143,21 +181,26 @@ class ButtonNotificationCard extends FloatingCard {
 		this.element.style.maxWidth = '250px';
 	}
 
+	addImageButton(href, imageFile, alt) {
+		const link = document.createElement('a');
+		link.href = href;
+		link.target = '_blank';
+		link.className = 'ut-block ut-text-center';
+		link.style.marginTop = '10px';
+
+		const img = document.createElement('img');
+		img.src = browser.runtime.getURL(imageFile);
+		img.height = 36;
+		img.style.border = '0';
+		img.alt = alt;
+		link.appendChild(img);
+
+		this.element.appendChild(link);
+		return link;
+	}
+
 	addKofiButton() {
-		const kofiButton = document.createElement('a');
-		kofiButton.href = 'https://ko-fi.com/R6R14IUBY';
-		kofiButton.target = '_blank';
-		kofiButton.className = 'ut-block ut-text-center';
-		kofiButton.style.marginTop = '10px';
-
-		const kofiImg = document.createElement('img');
-		kofiImg.src = browser.runtime.getURL('kofi-button.png');
-		kofiImg.height = 36;
-		kofiImg.style.border = '0';
-		kofiImg.alt = 'Buy Me a Coffee at ko-fi.com';
-		kofiButton.appendChild(kofiImg);
-
-		this.element.appendChild(kofiButton);
+		this.addImageButton('https://ko-fi.com/R6R14IUBY', 'kofi-button.png', 'Buy Me a Coffee at ko-fi.com');
 	}
 
 	addQoLButton() {
@@ -165,25 +208,13 @@ class ButtonNotificationCard extends FloatingCard {
 		if (hasQoL) return;
 
 		const isChrome = !!window.chrome && (!!window.chrome.webstore || !!window.chrome.runtime);
-
-		const storeLink = document.createElement('a');
-		storeLink.href = isChrome
+		const href = isChrome
 			? 'https://chromewebstore.google.com/detail/claude-qol/dkdnancajokhfclpjpplkhlkbhaeejob'
 			: 'https://addons.mozilla.org/en-US/firefox/addon/claude-qol/';
-		storeLink.target = '_blank';
-		storeLink.className = 'ut-block ut-text-center';
-		storeLink.style.marginTop = '10px';
-
-		const storeImg = document.createElement('img');
-		storeImg.src = browser.runtime.getURL('qol-badge.png');
-		storeImg.height = 36;
-		storeImg.style.border = '0';
-		storeImg.style.borderRadius = '4px';
-		storeImg.style.display = 'inline-block';
-		storeImg.alt = 'Get Claude QoL Extension';
-		storeLink.appendChild(storeImg);
-
-		this.element.appendChild(storeLink);
+		const link = this.addImageButton(href, 'qol-badge.png', 'Get Claude QoL Extension');
+		const img = link.querySelector('img');
+		img.style.borderRadius = '4px';
+		img.style.display = 'inline-block';
 	}
 
 	async addDesktopFooter() {
@@ -292,7 +323,7 @@ class DonationNotificationCard extends ButtonNotificationCard {
 
 		const supportMessage = document.createElement('div');
 		supportMessage.className = 'ut-mb-2';
-		supportMessage.style.fontSize = '0.9em';
+		supportMessage.style.fontWeight = 'bold';
 		supportMessage.textContent = 'Consider supporting continued development';
 
 		this.element.appendChild(dragHandle);
@@ -301,6 +332,42 @@ class DonationNotificationCard extends ButtonNotificationCard {
 
 		this.addKofiButton();
 		this.addQoLButton();
+
+		this.addCloseButton();
+		this.makeCardDraggable(dragHandle);
+	}
+}
+
+// Rate extension notification card
+class RateNotificationCard extends ButtonNotificationCard {
+	constructor() {
+		super();
+		this.build();
+	}
+
+	build() {
+		const dragHandle = document.createElement('div');
+		dragHandle.className = 'border-b border-border-400 ut-header';
+		dragHandle.textContent = 'Usage Tracker';
+
+		const message = document.createElement('div');
+		message.className = 'ut-mb-2';
+		message.textContent = 'Enjoying the Usage Tracker?';
+
+		const supportMessage = document.createElement('div');
+		supportMessage.className = 'ut-mb-2';
+		supportMessage.style.fontWeight = 'bold';
+		supportMessage.textContent = 'Consider leaving a rating!';
+
+		this.element.appendChild(dragHandle);
+		this.element.appendChild(message);
+		this.element.appendChild(supportMessage);
+
+		const isChrome = !!window.chrome && (!!window.chrome.webstore || !!window.chrome.runtime);
+		const rateUrl = isChrome
+			? 'https://chromewebstore.google.com/detail/claude-usage-tracker/knemcdpkggnbhpoaaagmjiigenifejfo'
+			: 'https://addons.mozilla.org/firefox/addon/claude-usage-tracker';
+		this.addImageButton(rateUrl, 'rate-badge.png', 'Rate this extension');
 
 		this.addCloseButton();
 		this.makeCardDraggable(dragHandle);
@@ -349,15 +416,11 @@ class SettingsCard extends FloatingCard {
 
 		// Event listeners
 		debugButton.addEventListener('click', async () => {
-			const result = await sendBackgroundMessage({
-				type: 'openDebugPage'
-			});
-
+			const result = await sendBackgroundMessage({ type: 'openDebugPage' });
 			if (result === 'fallback') {
-				window.location.href = browser.runtime.getURL('debug.html');
-			} else {
-				this.remove();
+				openDebugOverlay();
 			}
+			this.remove();
 		});
 
 		saveButton.addEventListener('click', async () => {
@@ -396,7 +459,7 @@ class SettingsCard extends FloatingCard {
 		const toggleLabel = document.createElement('label');
 		toggleLabel.htmlFor = 'ut-reset-notif-toggle';
 		toggleLabel.className = 'text-sm';
-		toggleLabel.innerHTML = 'Usage reset notifications<br><span style="font-size: 0.85em; opacity: 0.7;">(may spam due to a bug)</span>';
+		toggleLabel.innerHTML = 'Usage reset notifications';
 
 		toggleContainer.appendChild(checkbox);
 		toggleContainer.appendChild(toggleLabel);
@@ -496,6 +559,7 @@ class FloatingCardsUI {
 		await new Promise(resolve => setTimeout(resolve, 1000));
 		await this.checkForVersionUpdate();
 		await this.checkForDonationMilestone();
+		await this.checkForRateReminder();
 	}
 
 	async checkForVersionUpdate() {
@@ -535,26 +599,50 @@ class FloatingCardsUI {
 	}
 
 	async checkForDonationMilestone() {
-		const storage = await browser.storage.local.get(['shownDonationThresholds']);
-		const shownDonationThresholds = storage.shownDonationThresholds || [];
-
+		// Every 10M tokens tracked, rate limited to once per 30 days
+		const storage = await browser.storage.local.get(['lastDonationMilestone', 'lastDonationDate']);
 		const totalTokens = await sendBackgroundMessage({ type: 'getTotalTokensTracked' });
 
-		const exceededThreshold = DONATION_TOKEN_THRESHOLDS.find(threshold =>
-			totalTokens >= threshold && !shownDonationThresholds.includes(threshold)
-		);
-
-		if (!exceededThreshold) {
+		if (storage.lastDonationMilestone == null) {
+			const initial = totalTokens < DONATION_1M
+				? 0
+				: Math.ceil(totalTokens / DONATION_10M) * DONATION_10M;
+			await browser.storage.local.set({ lastDonationMilestone: initial });
 			return;
 		}
 
-		const tokenMillions = Math.floor(exceededThreshold / 1000000);
+		const last = storage.lastDonationMilestone;
 
-		await browser.storage.local.set({
-			shownDonationThresholds: [...shownDonationThresholds, exceededThreshold]
-		});
+		let next;
+		if (last < DONATION_1M) next = DONATION_1M;
+		else if (last < DONATION_10M) next = DONATION_10M;
+		else next = last + DONATION_10M;
 
-		const notificationCard = new DonationNotificationCard(tokenMillions);
+		if (totalTokens < next) return;
+
+		if (storage.lastDonationDate && Date.now() - storage.lastDonationDate < 30 * 24 * 60 * 60 * 1000) return;
+
+		await browser.storage.local.set({ lastDonationMilestone: next, lastDonationDate: Date.now() });
+
+		const notificationCard = new DonationNotificationCard(Math.floor(next / DONATION_1M));
+		notificationCard.show();
+	}
+
+	async checkForRateReminder() {
+
+		const storage = await browser.storage.local.get(['rateReminderTime', 'rateReminderShown']);
+
+		if (!storage.rateReminderTime) {
+			await browser.storage.local.set({ rateReminderTime: Date.now() + 7 * 24 * 60 * 60 * 1000 });
+			return;
+		}
+
+		if (storage.rateReminderShown) return;
+		if (Date.now() < storage.rateReminderTime) return;
+
+		await browser.storage.local.set({ rateReminderShown: true });
+
+		const notificationCard = new RateNotificationCard();
 		notificationCard.show();
 	}
 }

@@ -1,2 +1,1 @@
-Fully fix notification spam
-Improve support for claude code web
+Fix model detection (fixes caching indicator breaking sometimes)

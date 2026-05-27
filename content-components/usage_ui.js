@@ -1,6 +1,6 @@
-/* global CONFIG, Log, ProgressBar, sendBackgroundMessage,
+/* global CONFIG, Log, ProgressBar, sendBackgroundMessage, getActiveOrgId,
    setupTooltip, getResetTimeHTML, sleep, isMobileView, isCodePage, UsageData, isPeakHours,
-   RED_WARNING, BLUE_HIGHLIGHT, SUCCESS_GREEN, SELECTORS */
+   RED_WARNING, BLUE_HIGHLIGHT, SUCCESS_GREEN, SELECTORS, LayoutManager, mountToAnchor */
 'use strict';
 
 // Usage section with multiple limit bars
@@ -207,6 +207,7 @@ class UsageUI {
 		this.updateInterval = 1000;
 		this.wasPeakHours = isPeakHours();
 
+
 		this.setupMessageListener();
 		this.init();
 	}
@@ -216,6 +217,9 @@ class UsageUI {
 	setupMessageListener() {
 		browser.runtime.onMessage.addListener((message) => {
 			if (message.type === 'updateUsage') {
+				const msgOrgId = message.data.usageData?.orgId;
+				const myOrgId = getActiveOrgId();
+				if (msgOrgId && myOrgId && msgOrgId !== myOrgId) return;
 				this.handleUsageUpdate(message.data.usageData);
 			}
 		});
@@ -233,8 +237,6 @@ class UsageUI {
 		this.elements.chat = this.createChatElements();
 		this.elements.tooltips = this.createTooltips();
 		this.attachTooltips();
-
-		await this.mountSidebar();
 
 		this.uiReady = true;
 		await Log('UsageUI: Ready');
@@ -330,7 +332,7 @@ class UsageUI {
 		link.target = '_blank';
 		link.className = 'ut-link hover:text-text-200';
 		link.style.color = BLUE_HIGHLIGHT;
-		link.textContent = '💻 Desktop version available';
+		link.textContent = '💻 Claude Desktop version available';
 
 		footer.appendChild(link);
 		return footer;
@@ -446,8 +448,8 @@ class UsageUI {
 			d.setUTCHours(utcHour, 0, 0, 0);
 			return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 		};
-		const peakStart = formatLocal(13);
-		const peakEnd = formatLocal(19);
+		const peakStart = formatLocal(12);
+		const peakEnd = formatLocal(18);
 
 		return {
 			usage: create("How much of your 5-hour quota you've used"),
@@ -464,135 +466,16 @@ class UsageUI {
 
 	// ========== MOUNT (attach to page) ==========
 
-	async mountSidebar() {
-		if (isCodePage()) return this.mountSidebarCode();
-		return this.mountSidebarRegular();
-	}
-
-	async mountSidebarRegular() {
-		const sidebarNav = document.querySelector('nav.flex');
-		if (!sidebarNav) {
-			await Log("error", 'Could not find sidebar nav');
-			return false;
-		}
-
-		const containerWrapper = sidebarNav.querySelector('.flex.flex-grow.flex-col.overflow-y-auto');
-		const containers = containerWrapper?.querySelectorAll('.flex-1.relative');
-		if (!containers) {
-			await Log("warn", 'Could not find any sidebar containers');
-			return false;
-		}
-
-		let mainContainer = containers[containers.length - 1].querySelector('.px-2.mt-4');
-		if (!mainContainer) mainContainer = containers[containers.length - 1].querySelector('.px-2.pt-2');
-		if (!mainContainer) {
-			await Log("error", 'Could not find main container in sidebar');
-			return false;
-		}
-
-		const starredSection = mainContainer.querySelector('div.flex.flex-col.mb-4');
-		// Account for pref-switcher extension which positions itself after us and before starred
-		const prefSwitcher = mainContainer.querySelector('.preset-switcher-section');
-		const insertBefore = prefSwitcher || starredSection || mainContainer.firstChild;
-
-		// (Re)position if needed — handles late-appearing starred section
-		const sidebar = this.elements.sidebar.container;
-		if (insertBefore && sidebar.nextElementSibling !== insertBefore) {
-			mainContainer.insertBefore(sidebar, insertBefore);
-		} else if (!insertBefore && !mainContainer.contains(sidebar)) {
-			mainContainer.appendChild(sidebar);
-		}
-
-		this.elements.sidebar.container.classList.remove('px-2');
-		return true;
-	}
-
-	async mountSidebarCode() {
-		const sidebarNav = document.querySelector('nav.flex');
-		const sidebar = this.elements.sidebar.container;
-		sidebar.classList.add('px-2');
-
-		if (sidebarNav) {
-			// Desktop client / webUI with nav element
-			const scrollArea = sidebarNav.querySelector('.flex-grow.overflow-y-auto');
-			if (!scrollArea) {
-				await Log("warn", 'Could not find scroll area in code sidebar (nav path)');
-				return false;
-			}
-			if (!scrollArea.parentElement.contains(sidebar)) {
-				scrollArea.parentElement.insertBefore(sidebar, scrollArea);
-			}
-			return true;
-		}
-
-		// Standalone code sidebar (no nav element)
-		const codeLink = document.querySelector('a[href="/code"]');
-		if (!codeLink) {
-			await Log("error", 'Could not find sidebar nav or code link');
-			return false;
-		}
-
-		const sidebarRoot = codeLink.closest('.flex.flex-col.h-full.bg-bg-100');
-		if (!sidebarRoot) {
-			await Log("warn", 'Found code link but could not find sidebar root');
-			return false;
-		}
-
-		const scrollArea = sidebarRoot.querySelector('.overflow-y-auto.overflow-x-hidden');
-		if (!scrollArea) {
-			await Log("warn", 'Found code sidebar but could not locate scroll area');
-			return false;
-		}
-
-		// Insert above the "All projects" header
-		const outerWrapper = scrollArea.parentElement.parentElement;
-		if (!outerWrapper.contains(sidebar)) {
-			outerWrapper.insertBefore(sidebar, outerWrapper.firstElementChild);
-		}
-		return true;
+	mountSidebar() {
+		const anchor = LayoutManager.getAnchor('sidebar');
+		if (!anchor) return false;
+		return mountToAnchor(this.elements.sidebar.container, anchor);
 	}
 
 	mountChatArea() {
-		if (isCodePage()) return this.mountChatAreaCode();
-		return this.mountChatAreaRegular();
-	}
-
-	mountChatAreaRegular() {
-		const modelSelector = document.querySelector(SELECTORS.MODEL_SELECTOR);
-		if (!modelSelector) return false;
-
-		const selectorLine = modelSelector?.parentElement?.parentElement;
-		if (!selectorLine?.parentElement) return false;
-
-		const parentContainer = selectorLine.parentElement;
-		if (parentContainer.nextElementSibling !== this.elements.chat.statLine) {
-			parentContainer.after(this.elements.chat.statLine);
-		}
-
-		this.elements.chat.statLine.style.paddingLeft = '6px';
-		this.elements.chat.statLine.style.paddingRight = '';
-		this.elements.chat.statLine.style.paddingBottom = '';
-
-		return true;
-	}
-
-	mountChatAreaCode() {
-		const modelSelector = document.querySelector(SELECTORS.MODEL_SELECTOR);
-		if (!modelSelector) return false;
-
-		// Find the toolbar row reliably regardless of wrapper depth
-		const toolbar = modelSelector.closest('.flex.items-center.p-2');
-		if (!toolbar) return false;
-
-		if (toolbar.nextElementSibling !== this.elements.chat.statLine) {
-			toolbar.after(this.elements.chat.statLine);
-		}
-
-		this.elements.chat.statLine.style.paddingLeft = '8px';
-		this.elements.chat.statLine.style.paddingRight = '8px';
-		this.elements.chat.statLine.style.paddingBottom = '4px';
-
-		return true;
+		const anchor = LayoutManager.getAnchor('chatArea');
+		if (!anchor) return false;
+		return mountToAnchor(this.elements.chat.statLine, anchor);
 	}
 
 	// ========== RENDER (state → DOM) ==========
@@ -763,7 +646,7 @@ class UsageUI {
 				this.checkModelChange();
 				this.checkPeakHoursChange();
 				this.checkQoLInstalled();
-				await this.mountSidebar();
+				this.mountSidebar();
 				this.mountChatArea();
 			}
 			requestAnimationFrame(update);

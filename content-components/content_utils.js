@@ -124,15 +124,31 @@ async function logError(error) {
 // Utility functions
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+function isIncognitoConversation() {
+	return new URLSearchParams(window.location.search).has('incognito');
+}
+
 function getConversationId() {
+	if (isIncognitoConversation()) {
+		try {
+			const data = JSON.parse(sessionStorage.getItem('incognito_temporary_conversation_uuid'));
+			return data?.uuid || null;
+		} catch {
+			return null;
+		}
+	}
 	const match = window.location.pathname.match(/\/chat\/([^/?]+)/);
 	return match ? match[1] : null;
+}
+
+function getActiveOrgId() {
+	return document.cookie.split('; ').find(row => row.startsWith('lastActiveOrg='))?.split('=')[1] || null;
 }
 
 async function sendBackgroundMessage(message) {
 	const enrichedMessage = {
 		...message,
-		orgId: document.cookie.split('; ').find(row => row.startsWith('lastActiveOrg='))?.split('=')[1]
+		orgId: getActiveOrgId()
 	};
 	let counter = 10;
 	while (counter > 0) {
@@ -169,26 +185,32 @@ async function waitForElement(target, selector, maxTime = 1000) {
 
 async function getCurrentModel(maxWait = 3000) {
 	const modelSelector = await waitForElement(document, SELECTORS.MODEL_PICKER, maxWait);
-	if (!modelSelector) return undefined;
+	if (!modelSelector) return CONFIG.DEFAULT_MODEL;
 
-	let fullModelName = modelSelector.querySelector('.whitespace-nowrap')?.textContent?.trim() || 'default';
-	if (!fullModelName || fullModelName === 'default') return undefined;
+	const fullModelName = modelSelector.querySelector('.whitespace-nowrap')?.textContent?.trim()?.toLowerCase();
+	if (!fullModelName) return CONFIG.DEFAULT_MODEL;
 
-	fullModelName = fullModelName.toLowerCase();
-	const modelTypes = CONFIG.MODELS
-
-	for (const modelType of modelTypes) {
+	for (const modelType of CONFIG.MODELS) {
 		if (fullModelName.includes(modelType.toLowerCase())) {
 			return modelType;
 		}
 	}
-	await Log("Could not find matching model, returning undefined")
-	return undefined;
+	await Log("Could not find matching model, returning default")
+	return CONFIG.DEFAULT_MODEL;
+}
+
+async function getCurrentModelVersion(maxWait = 3000) {
+	const modelSelector = await waitForElement(document, SELECTORS.MODEL_PICKER, maxWait);
+	if (!modelSelector) return CONFIG.DEFAULT_MODEL_VERSION;
+	const text = modelSelector.querySelector('.whitespace-nowrap')?.textContent?.trim();
+    if (!text) return CONFIG.DEFAULT_MODEL_VERSION;
+    const normalizedText = text.toLowerCase();
+    const matchedModel = Object.keys(CONFIG.MODEL_VERSION_MAP).find(key => normalizedText.startsWith(key));
+	return matchedModel ? CONFIG.MODEL_VERSION_MAP[matchedModel] : CONFIG.DEFAULT_MODEL_VERSION;
 }
 
 function isMobileView() {
-	// Check if height > width (portrait orientation)
-	return window.innerHeight > window.innerWidth;
+	return matchMedia('(pointer: coarse)').matches && window.innerWidth < 768;
 }
 
 function isCodePage() {
@@ -405,15 +427,10 @@ class ProgressBar {
 // Message handlers for background script requests
 browser.runtime.onMessage.addListener(async (message) => {
 	if (message.type === 'getActiveModel') {
-		const currModel = await getCurrentModel();
-		return currModel || "Sonnet";
+		return await getCurrentModel();
 	}
 	if (message.action === "getOrgID") {
-		const orgId = document.cookie
-			.split('; ')
-			.find(row => row.startsWith('lastActiveOrg='))
-			?.split('=')[1];
-		return Promise.resolve({ orgId });
+		return Promise.resolve({ orgId: getActiveOrgId() });
 	}
 	if (message.action === "getStyleId") {
 		const storedStyle = localStorage.getItem('LSS-claude_personalized_style');
@@ -445,6 +462,302 @@ async function injectStyles() {
 	}
 }
 
+// ========== PAGE LAYOUTS ==========
+// Centralized layout detection and anchor resolution.
+// Each layout has match() to detect the page and anchors to find DOM insertion points.
+// Checked in order; first match() wins.
+
+function getSidebarRegularAnchor() {
+	const sidebarNav = document.querySelector('nav.flex');
+	if (!sidebarNav) return null;
+
+	const containerWrapper = sidebarNav.querySelector('.flex.flex-grow.flex-col.overflow-y-auto');
+	const containers = containerWrapper?.querySelectorAll('.flex-1.relative');
+	if (!containers) return null;
+
+	let mainContainer = containers[containers.length - 1].querySelector('.px-2.mt-4');
+	if (!mainContainer) mainContainer = containers[containers.length - 1].querySelector('.px-2.pt-2');
+	if (!mainContainer) return null;
+
+	const starredSection = mainContainer.querySelector('div.flex.flex-col.mb-4');
+	const prefSwitcher = mainContainer.querySelector('.preset-switcher-section');
+	const referenceNode = prefSwitcher || starredSection || mainContainer.firstChild || null;
+
+	return {
+		parent: mainContainer,
+		referenceNode,
+		classes: { remove: ['px-2'] },
+	};
+}
+
+function getSidebarDesktopAnchor() {
+	const sidebarBody = document.querySelector('.dframe-sidebar-body');
+	if (!sidebarBody) return null;
+
+	const navScroll = sidebarBody.querySelector('.dframe-nav-scroll');
+	if (!navScroll) return null;
+
+	return {
+		parent: navScroll.parentElement,
+		referenceNode: navScroll,
+	};
+}
+
+function getChatAreaRegularAnchor() {
+	const modelSelector = document.querySelector(SELECTORS.MODEL_SELECTOR);
+	if (!modelSelector) return null;
+
+	const toolbarRow = modelSelector.closest('.flex.w-full.items-center');
+	if (!toolbarRow) return null;
+
+	return {
+		insertAfter: toolbarRow,
+		styles: { paddingLeft: '6px', paddingRight: '', paddingBottom: '' },
+	};
+}
+
+function getTitleAreaAnchor() {
+	const chatMenu = document.querySelector(SELECTORS.CHAT_MENU);
+	if (!chatMenu) return null;
+
+	const titleLine = chatMenu.closest('.flex.min-w-0.flex-1');
+	if (!titleLine) return null;
+
+	const headerRow = titleLine.parentElement;
+
+	if (isMobileView()) {
+		if (!headerRow) return null;
+		headerRow.classList.add('flex-wrap');
+
+		const headerPadding = parseFloat(getComputedStyle(headerRow).paddingLeft) || 0;
+		return {
+			parent: headerRow,
+			referenceNode: null,
+			styles: {
+				flexBasis: '100%',
+				marginTop: '-36px',
+				marginLeft: `-${headerPadding}px`,
+				paddingLeft: `${headerPadding + 8}px`,
+			},
+			classes: { add: ['bg-bg-100'], remove: ['!px-2'] },
+		};
+	} else {
+		titleLine.classList.add('flex-wrap');
+
+		const hasProject = !!titleLine.querySelector('a[href^="/project/"]');
+		return {
+			parent: titleLine,
+			referenceNode: null,
+			styles: { flexBasis: '100%' },
+			classes: {}
+			//classes: { toggle: { '!px-2': !hasProject } },
+		};
+	}
+}
+
+const pageLayouts = {
+	// Desktop client layouts (checked first — desktop has dframe-sidebar, not nav.flex)
+	desktopChat: {
+		match() { return !!document.querySelector('aside.dframe-sidebar') && !isCodePage() && !!getConversationId(); },
+		anchors: {
+			sidebar: getSidebarDesktopAnchor,
+			chatArea: getChatAreaRegularAnchor,
+			titleArea() {
+				const chatMenu = document.querySelector(SELECTORS.CHAT_MENU);
+				if (!chatMenu) return null;
+
+				const titleLine = chatMenu.closest('.font-base-bold');
+				if (!titleLine) return null;
+
+				const headerRow = titleLine.parentElement;
+
+				if (isMobileView()) {
+					if (!headerRow) return null;
+					headerRow.classList.add('flex-wrap');
+					const headerPadding = parseFloat(getComputedStyle(headerRow).paddingLeft) || 0;
+					return {
+						parent: headerRow,
+						referenceNode: null,
+						styles: {
+							flexBasis: '100%',
+							marginTop: '-36px',
+							marginLeft: `-${headerPadding}px`,
+							paddingLeft: `${headerPadding + 8}px`,
+						},
+						classes: { add: ['bg-bg-100'], remove: ['!px-2'] },
+					};
+				} else {
+					titleLine.classList.add('flex-wrap');
+					const hasProject = !!titleLine.querySelector('a[href^="/project/"]');
+					return {
+						parent: titleLine,
+						referenceNode: null,
+						styles: { flexBasis: '100%' },
+						classes: {},
+					};
+				}
+			},
+		},
+	},
+	desktopCoworkHome: {
+		match() { return !!document.querySelector('aside.dframe-sidebar') && window.location.pathname === '/task/new'; },
+		anchors: {
+			sidebar: getSidebarDesktopAnchor,
+			chatArea() {
+				const chatInput = document.querySelector('[data-testid="chat-input"]');
+				if (!chatInput) return null;
+
+				const inputContainer = chatInput.closest('.flex.flex-col.gap-3');
+				if (!inputContainer) return null;
+
+				const toolbarRow = inputContainer.querySelector('.flex.w-full.items-center');
+				if (!toolbarRow) return null;
+
+				return {
+					insertAfter: toolbarRow,
+					styles: { paddingLeft: '6px', paddingRight: '', paddingBottom: '' },
+				};
+			},
+		},
+	},
+	desktopHome: {
+		match() { return !!document.querySelector('aside.dframe-sidebar') && !isCodePage() && !getConversationId(); },
+		anchors: {
+			sidebar: getSidebarDesktopAnchor,
+			chatArea: getChatAreaRegularAnchor,
+		},
+	},
+	// Web layouts
+	chat: {
+		match() { return !isCodePage() && !isIncognitoConversation() && !!getConversationId(); },
+		anchors: {
+			sidebar: getSidebarRegularAnchor,
+			chatArea: getChatAreaRegularAnchor,
+			titleArea: getTitleAreaAnchor,
+		},
+	},
+	code: {
+		match() { return isCodePage(); },
+		anchors: {
+			sidebar() {
+				const sidebarNav = document.querySelector('nav.flex');
+
+				if (sidebarNav) {
+					const scrollArea = sidebarNav.querySelector('.flex-grow.overflow-y-auto');
+					if (!scrollArea) return null;
+					return {
+						parent: scrollArea.parentElement,
+						referenceNode: scrollArea,
+						classes: { add: ['px-2'] },
+					};
+				}
+
+				// Standalone code sidebar (no nav element)
+				const codeLink = document.querySelector('a[href="/code"]');
+				if (!codeLink) return null;
+
+				const sidebarRoot = codeLink.closest('.flex.flex-col.h-full.bg-bg-100');
+				if (!sidebarRoot) return null;
+
+				const scrollArea = sidebarRoot.querySelector('.overflow-y-auto.overflow-x-hidden');
+				if (!scrollArea) return null;
+
+				const outerWrapper = scrollArea.parentElement.parentElement;
+				return {
+					parent: outerWrapper,
+					referenceNode: outerWrapper.firstElementChild,
+					classes: { add: ['px-2'] },
+				};
+			},
+			chatArea() {
+				const modelSelector = document.querySelector(SELECTORS.MODEL_SELECTOR);
+				if (!modelSelector) return null;
+
+				const toolbar = modelSelector.closest('.flex.items-center.p-2');
+				if (!toolbar) return null;
+
+				return {
+					insertAfter: toolbar,
+					styles: { paddingLeft: '8px', paddingRight: '8px', paddingBottom: '4px' },
+				};
+			},
+		},
+	},
+	incognitoConversation: {
+		// Incognito conversations have no convID in the URL and a special sessionStorage key for it instead, but otherwise behave like regular chats.
+		match() { return isIncognitoConversation(); },
+		anchors: {
+			sidebar: getSidebarRegularAnchor,
+			chatArea: getChatAreaRegularAnchor,
+			titleArea() {
+				const incognitoHeader = document.querySelector('.z-header .text-sm.select-none');
+				if (!incognitoHeader || incognitoHeader.textContent.trim() !== 'Incognito chat') return null;
+
+				const headerRow = incognitoHeader.parentElement;
+				headerRow.classList.add('flex-wrap');
+
+				return {
+					parent: headerRow,
+					referenceNode: null,
+					styles: { flexBasis: '100%', paddingLeft: '8px', marginTop: '12px' },
+				};
+			},
+		},
+	},
+	home: {
+		match() { return !isCodePage() && !getConversationId(); },
+		anchors: {
+			sidebar: getSidebarRegularAnchor,
+			chatArea: getChatAreaRegularAnchor,
+		},
+	},
+};
+
+const LayoutManager = {
+	detectLayout() {
+		for (const [name, layout] of Object.entries(pageLayouts)) {
+			if (layout.match()) return { name, ...layout };
+		}
+		return null;
+	},
+	getAnchor(anchorName) {
+		const layout = this.detectLayout();
+		const anchorFn = layout?.anchors?.[anchorName];
+		if (!anchorFn) return null;
+		return anchorFn();
+	},
+};
+
+function mountToAnchor(element, anchor) {
+	let needsInsert;
+	if (anchor.insertAfter) {
+		needsInsert = anchor.insertAfter.nextElementSibling !== element;
+	} else if (anchor.referenceNode) {
+		needsInsert = element.nextElementSibling !== anchor.referenceNode
+			|| element.parentElement !== anchor.parent;
+	} else {
+		needsInsert = element.parentElement !== anchor.parent;
+	}
+
+	if (needsInsert) {
+		if (anchor.insertAfter) {
+			anchor.insertAfter.after(element);
+		} else {
+			anchor.parent.insertBefore(element, anchor.referenceNode || null);
+		}
+	}
+
+	if (anchor.styles) Object.assign(element.style, anchor.styles);
+	if (anchor.classes?.add) element.classList.add(...anchor.classes.add);
+	if (anchor.classes?.remove) element.classList.remove(...anchor.classes.remove);
+	if (anchor.classes?.toggle) {
+		for (const [cls, force] of Object.entries(anchor.classes.toggle)) {
+			element.classList.toggle(cls, force);
+		}
+	}
+	return true;
+}
+
 // Main initialization
 async function initExtension() {
 	if (window.claudeTrackerInstance) {
@@ -454,7 +767,7 @@ async function initExtension() {
 	window.claudeTrackerInstance = true;
 
 	// Clean up any leftover UI elements from a previous instance (e.g. extension toggled off/on)
-	document.querySelectorAll('[class*="ut-"]').forEach(el => el.remove());
+	document.querySelectorAll('[class^="ut-"], [class*=" ut-"]').forEach(el => el.remove());
 	const oldStyles = document.getElementById('ut-styles');
 	if (oldStyles) oldStyles.remove();
 
@@ -462,26 +775,44 @@ async function initExtension() {
 	CONFIG = await sendBackgroundMessage({ type: 'getConfig' });
 	await Log("Config received...");
 
-	// Wait for login
+	// Incognito conversations never have the standard sidebar structure.
+    // Skip the 6-second wait to avoid a spurious warning and wasted polling.
+    if (new URLSearchParams(window.location.search).has('incognito')) {
+        await Log('Incognito mode: skipping sidebar anchor wait');
+        sendBackgroundMessage({ type: 'requestData' });
+        sendBackgroundMessage({ type: 'initOrg' });
+        await Log('Initialization complete. Ready to track tokens.');
+        return;
+    }
+
+	// Wait for page to be ready (sidebar anchor available = logged in and DOM loaded)
 	const LOGIN_CHECK_DELAY = 10000;
 	while (true) {
-		let userMenuButton = await waitForElement(document, 'button[data-testid="user-menu-button"]', 6000);
-		if (!userMenuButton) userMenuButton = document.querySelector('button[data-testid="code-user-menu-button"]');
+		let sidebarAnchor = null;
+		const maxWait = 6000;
+		const interval = 100;
+		let elapsed = 0;
+		while (elapsed < maxWait) {
+			sidebarAnchor = LayoutManager.getAnchor('sidebar');
+			if (sidebarAnchor) break;
+			await sleep(interval);
+			elapsed += interval;
+		}
 
-		if (userMenuButton) {
-			if (userMenuButton.getAttribute('data-script-loaded')) {
+		if (sidebarAnchor) {
+			if (sidebarAnchor.parent.getAttribute('data-script-loaded')) {
 				await Log('Script already running, stopping duplicate');
 				return;
 			}
-			userMenuButton.setAttribute('data-script-loaded', true);
+			sidebarAnchor.parent.setAttribute('data-script-loaded', true);
 			break;
 		}
 
 		const initialLoginScreen = document.querySelector(SELECTORS.INIT_LOGIN_SCREEN);
 		const verificationLoginScreen = document.querySelector(SELECTORS.VERIF_LOGIN_SCREEN);
 		if (!initialLoginScreen && !verificationLoginScreen) {
-			await Log("error", 'Neither user menu button nor any login screen found');
-			return;
+			await Log("warn", 'No sidebar anchor found and no login screen detected, proceeding anyway');
+			break;
 		}
 		await Log('Login screen detected, waiting before retry...');
 		await sleep(LOGIN_CHECK_DELAY);

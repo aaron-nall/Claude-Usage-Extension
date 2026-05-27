@@ -11,6 +11,18 @@ const CONFIG = {
 		"Sonnet": 3,
 		"Haiku": 1
 	},
+	"DEFAULT_MODEL": "Opus",
+	"MODEL_VERSION_MAP": {
+		// DOM labels (lowercased) → API model IDs
+		"opus 4.7": "claude-opus-4-7",
+		"sonnet 4.6": "claude-sonnet-4-6",
+		"opus 4.6": "claude-opus-4-6",
+		"opus 4.5": "claude-opus-4-5-20251101",
+		"sonnet 4.5": "claude-sonnet-4-5-20250929",
+		"haiku 4.5": "claude-haiku-4-5-20251001",
+		"opus 3": "claude-3-opus-20240229",
+	},
+	"DEFAULT_MODEL_VERSION": "claude-opus-4-7",
 	"WARNING_THRESHOLD": 0.9,
 	"PEAK_SESSION_MULTIPLIER": 1.5,
 	"WARNING": {
@@ -21,20 +33,21 @@ const CONFIG = {
 	"BASE_SYSTEM_PROMPT_LENGTH": 3200,
 	"CACHING_MULTIPLIER": 0, // Seems to be free.
 	"EXTRA_USAGE_CACHING_MULTIPLIER": 0.1, // Cache reads cost 10% of input during extra usage
-	"TOKEN_CACHING_DURATION_MS": 5 * 60 * 1000, // 5 minutes
+	"TOKEN_CACHING_DURATION_MS": 60 * 60 * 1000, // 1 hour
 	"ESTIMATED_CAPS": {
 		// I have no idea. This is very napkin math.
 		"claude_free": {
 			"session": 375000
 		},
 		"claude_pro": {},
+		"claude_team": {},
 		// Genuinely mostly just vibes here, this is just a first draft
 
 		// V5.2 will do telemetry to refine these values
 		"claude_max_5x": {
-			"session": 7.5 * 10 ** 6,
-			"weekly": 75 * 10 ** 6,	// 10 sessions
-			"sonnetWeekly": 45 * 10 ** 6 // Same as weekly but compensated for sonnet
+			"session": 15 * 10 ** 6,
+			"weekly": 150 * 10 ** 6,	// 10 sessions
+			"sonnetWeekly": 90 * 10 ** 6 // Same as weekly but compensated for sonnet
 		},
 		"claude_max_20x": {}
 	}
@@ -44,6 +57,7 @@ function fillEstimatedCaps(caps) {
 	// Multipliers relative to pro (the base tier)
 	const tierMultipliers = {
 		claude_pro: 1,
+		claude_team: 1.25, // Just based off the price, no idea how to differentiate between standard and premium team seats
 		claude_max_5x: 5,
 		claude_max_20x: 20,
 	};
@@ -80,7 +94,6 @@ function fillEstimatedCaps(caps) {
 }
 
 CONFIG.ESTIMATED_CAPS = fillEstimatedCaps(CONFIG.ESTIMATED_CAPS);
-console.log("Final estimated caps:", CONFIG.ESTIMATED_CAPS);
 
 const isElectron = chrome.action === undefined || navigator.userAgent.includes("Electron");
 const FORCE_DEBUG = true; // Set to true to force debug mode
@@ -164,6 +177,36 @@ async function containerFetch(url, options = {}, cookieStoreId = null) {
 	return fetch(url, options);
 }
 
+const containerRequestMap = new Map();
+
+async function redirectCookie(setCookieStr, requestUrl, storeId) {
+	const parts = setCookieStr.split(';').map(p => p.trim());
+	const [nameValue, ...attrs] = parts;
+	const eqIdx = nameValue.indexOf('=');
+	const name = nameValue.substring(0, eqIdx);
+	const value = nameValue.substring(eqIdx + 1);
+
+	const cookieDetails = { url: requestUrl, name, value, storeId };
+
+	for (const attr of attrs) {
+		const lower = attr.toLowerCase();
+		if (lower.startsWith('domain=')) cookieDetails.domain = attr.split('=')[1];
+		else if (lower.startsWith('path=')) cookieDetails.path = attr.split('=')[1];
+		else if (lower.startsWith('expires=')) {
+			cookieDetails.expirationDate = Math.floor(new Date(attr.substring(8)).getTime() / 1000);
+		}
+		else if (lower === 'secure') cookieDetails.secure = true;
+		else if (lower === 'httponly') cookieDetails.httpOnly = true;
+		else if (lower.startsWith('samesite=')) {
+			const val = attr.split('=')[1].toLowerCase();
+			cookieDetails.sameSite = val === 'none' ? 'no_restriction' : val;
+		}
+	}
+
+	await Log("Redirecting cookie", name, "to store:", storeId);
+	await browser.cookies.set(cookieDetails);
+}
+
 async function addContainerFetchListener() {
 	if (isElectron || !chrome.cookies) return;
 	const stores = await browser.cookies.getAllCookieStores();
@@ -179,7 +222,7 @@ async function addContainerFetchListener() {
 				)?.value;
 
 				if (containerStore) {
-					//await Log("Processing request for container:", containerStore, "URL:", details.url);
+					containerRequestMap.set(details.requestId, containerStore);
 
 					// Extract domain from URL
 					const url = new URL(details.url);
@@ -190,7 +233,6 @@ async function addContainerFetchListener() {
 						domain: domain,
 						storeId: containerStore
 					});
-					//await Log("Found cookies for domain:", domain, "in container:", containerStore);
 					if (domainCookies.length > 0) {
 						// Create or find the cookie header
 						let cookieHeader = details.requestHeaders.find(h => h.name === 'Cookie');
@@ -214,6 +256,37 @@ async function addContainerFetchListener() {
 			},
 			{ urls: ["<all_urls>"] },
 			["blocking", "requestHeaders"]
+		);
+
+		browser.webRequest.onHeadersReceived.addListener(
+			async (details) => {
+				const containerStore = containerRequestMap.get(details.requestId);
+				if (!containerStore) return;
+				containerRequestMap.delete(details.requestId);
+
+				const setCookieHeaders = details.responseHeaders.filter(
+					h => h.name.toLowerCase() === 'set-cookie'
+				);
+				if (setCookieHeaders.length === 0) return;
+
+				await Log("Redirecting", setCookieHeaders.length, "Set-Cookie header(s) from request", details.requestId, "to container:", containerStore);
+				for (const header of setCookieHeaders) {
+					await redirectCookie(header.value, details.url, containerStore);
+				}
+
+				return {
+					responseHeaders: details.responseHeaders.filter(
+						h => h.name.toLowerCase() !== 'set-cookie'
+					)
+				};
+			},
+			{ urls: ["<all_urls>"] },
+			["blocking", "responseHeaders"]
+		);
+
+		browser.webRequest.onErrorOccurred.addListener(
+			(details) => containerRequestMap.delete(details.requestId),
+			{ urls: ["<all_urls>"] }
 		);
 	}
 }
